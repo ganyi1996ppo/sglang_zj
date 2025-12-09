@@ -260,7 +260,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
-        input_ids_tensor = torch.as_tensor(input_ids)
+        input_ids_tensor = np.array(input_ids)
 
         # Create mapping of token_ids to pad_values for each modality
         token_to_pad_mapping = {}
