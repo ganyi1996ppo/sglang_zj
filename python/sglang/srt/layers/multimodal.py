@@ -152,6 +152,7 @@ def gpu_tensor_hash(
     num_warps: int = 4,
     num_stages: int = 4,
     use_cg: bool = True,
+    gpu_hash: bool = False,
 ) -> int:
     assert tensor.is_cuda, "Use .cuda() first"
     u32 = _as_uint32_words(tensor)
@@ -185,5 +186,6 @@ def gpu_tensor_hash(
         nxt = torch.empty(grid2[0], dtype=torch.uint64, device=cur.device)
         add_tree_reduce_u64_kernel[grid2](cur, nxt, n_elems, CHUNK=reduce_chunk)
         cur = nxt
-
+    if gpu_hash:
+        return cur
     return _final_splitmix64(int(cur.item()))

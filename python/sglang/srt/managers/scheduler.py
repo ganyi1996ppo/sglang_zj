@@ -508,7 +508,8 @@ class Scheduler(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
-                (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
+                # (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
+                (BatchTokenizedGenerateReqInput, self.handle_batching_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
@@ -999,7 +1000,8 @@ class Scheduler(
 
         while True:
             recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+            # self.process_input_requests(recv_reqs)
+            self.process_batched_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1159,6 +1161,37 @@ class Scheduler(
                         self.recv_from_rpc.send_pyobj(output)
                 else:
                     self.send_to_tokenizer.send_output(output, recv_req)
+
+    def process_batched_input_requests(self, recv_reqs: List):
+        tokenize_generate_reqs = []
+        tokenize_embedding_reqs = []
+        for recv_req in recv_reqs:
+            if is_health_check_generate_req(recv_req) and (
+                self.chunked_req is not None
+                or not self.running_batch.is_empty()
+                or len(self.offload_tags) > 0
+            ):
+                self.return_health_check_ct += 1
+                continue
+            if isinstance(recv_req, TokenizedGenerateReqInput):
+                tokenize_generate_reqs.append(recv_req)
+            elif isinstance(recv_req, TokenizedEmbeddingReqInput):
+                tokenize_embedding_reqs.append(recv_req)
+            else:
+                output = self._request_dispatcher(recv_req)
+                if output is not None:
+                    if isinstance(output, RpcReqOutput):
+                        if self.recv_from_rpc is not None:
+                            self.recv_from_rpc.send_pyobj(output)
+                    else:
+                        self.send_to_tokenizer.send_output(output, recv_req)
+
+        batched_tokenize_generate_reqs = BatchTokenizedGenerateReqInput(batch=tokenize_generate_reqs)
+        batched_tokenize_embedding_reqs = BatchTokenizedEmbeddingReqInput(batch=tokenize_embedding_reqs)
+
+        self._request_dispatcher(batched_tokenize_generate_reqs)
+        self._request_dispatcher(batched_tokenize_embedding_reqs)
+
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -1352,6 +1385,189 @@ class Scheduler(
         # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
+
+
+    def handle_batching_generate_request(
+        self,
+        recv_reqs: BatchTokenizedGenerateReqInput,
+    ):
+        # Create a new request
+        reqs = []
+        for recv_req in recv_reqs:
+            if (
+                recv_req.session_params is None
+                or recv_req.session_params.id is None
+                or recv_req.session_params.id not in self.sessions
+            ):
+                if recv_req.input_embeds is not None:
+                    # Generate fake input_ids based on the length of input_embeds
+                    seq_length = len(recv_req.input_embeds)
+                    fake_input_ids = [1] * seq_length
+                    recv_req.input_ids = fake_input_ids
+
+                if recv_req.bootstrap_port is None:
+                    # Use default bootstrap port
+                    recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
+
+                req = Req(
+                    recv_req.rid,
+                    recv_req.input_text,
+                    recv_req.input_ids,
+                    recv_req.sampling_params,
+                    return_logprob=recv_req.return_logprob,
+                    top_logprobs_num=recv_req.top_logprobs_num,
+                    token_ids_logprob=recv_req.token_ids_logprob,
+                    stream=recv_req.stream,
+                    lora_id=recv_req.lora_id,
+                    input_embeds=recv_req.input_embeds,
+                    custom_logit_processor=recv_req.custom_logit_processor,
+                    return_hidden_states=recv_req.return_hidden_states,
+                    eos_token_ids=self.model_config.hf_eos_token_id,
+                    bootstrap_host=recv_req.bootstrap_host,
+                    bootstrap_port=recv_req.bootstrap_port,
+                    bootstrap_room=recv_req.bootstrap_room,
+                    disagg_mode=self.disaggregation_mode,
+                    data_parallel_rank=recv_req.data_parallel_rank,
+                    vocab_size=self.model_config.vocab_size,
+                    priority=recv_req.priority,
+                    metrics_collector=(
+                        self.metrics_collector if self.enable_metrics else None
+                    ),
+                    http_worker_ipc=recv_req.http_worker_ipc,
+                )
+                req.tokenizer = self.tokenizer
+
+                if self.disaggregation_mode != DisaggregationMode.NULL:
+                    # Invalid request for disaggregated mode
+                    if recv_req.bootstrap_room is None:
+                        error_msg = (
+                            f"Invalid request: Disaggregated request received without "
+                            f"boostrap room id. {req.rid=}"
+                        )
+                        logger.error(error_msg)
+                        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                        self.stream_output([req], req.return_logprob)
+                        continue
+
+                if (
+                    recv_req.session_params is not None
+                    and recv_req.session_params.id is not None
+                ):
+                    req.set_finish_with_abort(
+                        f"Invalid request: session id {recv_req.session_params.id} does not exist"
+                    )
+                    self.init_req_max_new_tokens(req)
+                    self._add_request_to_queue(req)
+                    continue
+            else:
+                # Create a new request from a previous session
+                session = self.sessions[recv_req.session_params.id]
+                req = session.create_req(recv_req, self.tokenizer)
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    self.init_req_max_new_tokens(req)
+                    self._add_request_to_queue(req)
+                    continue
+            reqs.append((req, recv_req))
+
+        for idx, item in enumerate(reqs):
+            req, recv_req = item
+            if recv_req.mm_inputs is not None:
+                image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs, async_init=True)
+                reqs[idx] = (req, recv_req, image_inputs)
+            else:
+                reqs[idx] = (req, recv_req, None)
+
+        for req, recv_req, image_inputs in reqs:
+            if recv_req.mm_inputs is not None:
+                image_inputs.set_pad_value_async()
+                req.origin_input_ids = self.pad_input_ids_func(
+                    req.origin_input_ids, image_inputs
+                )
+                req.extend_image_inputs(image_inputs)
+
+                if len(req.origin_input_ids) >= self.max_req_input_len:
+                    req.set_finish_with_abort(
+                        error_msg=(
+                            "Multimodal prompt is too long after expanding multimodal tokens. "
+                            f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+                        )
+                    )
+                    self.init_req_max_new_tokens(req)
+                    self._add_request_to_queue(req)
+                    continue
+
+            # initialize before returning
+            self.init_req_max_new_tokens(req)
+
+            # Validate prompt length
+            error_msg = validate_input_length(
+                req,
+                self.max_req_input_len,
+                self.server_args.allow_auto_truncate,
+            )
+            if error_msg:
+                req.set_finish_with_abort(error_msg)
+                self._add_request_to_queue(req)
+                return
+
+            # Copy more attributes
+            if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
+                # By default, only return the logprobs for output tokens
+                # For prefill-only requests with logprob_start_len == -1, set logprob_start_len beyond input sequence
+                # to skip input logprob computation entirely
+                if req.is_prefill_only:
+                    req.logprob_start_len = len(req.origin_input_ids)
+                else:
+                    # TODO: For text generation, evaluate setting logprob_start_len to len(req.origin_input_ids) as well
+                    req.logprob_start_len = len(req.origin_input_ids) - 1
+            else:
+                req.logprob_start_len = recv_req.logprob_start_len
+
+            if not req.is_prefill_only and req.logprob_start_len >= len(
+                req.origin_input_ids
+            ):
+                error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.set_finish_with_abort(error_msg)
+                self._add_request_to_queue(req)
+                return
+
+            # Init grammar cache for this request
+            add_to_grammar_queue = False
+            if (
+                req.sampling_params.json_schema is not None
+                or req.sampling_params.regex is not None
+                or req.sampling_params.ebnf is not None
+                or req.sampling_params.structural_tag is not None
+            ):
+                if self.grammar_backend is None:
+                    error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                    req.set_finish_with_abort(error_msg)
+                else:
+                    if req.sampling_params.json_schema is not None:
+                        key = ("json", req.sampling_params.json_schema)
+                    elif req.sampling_params.regex is not None:
+                        key = ("regex", req.sampling_params.regex)
+                    elif req.sampling_params.ebnf is not None:
+                        key = ("ebnf", req.sampling_params.ebnf)
+                    elif req.sampling_params.structural_tag:
+                        key = ("structural_tag", req.sampling_params.structural_tag)
+
+                    value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+                    req.grammar = value
+
+                    if not cache_hit:
+                        req.grammar_key = key
+                        add_to_grammar_queue = True
+                    else:
+                        if value is INVALID_GRAMMAR_OBJ:  # We hit a cached invalid grammar.
+                            error_msg = f"Invalid grammar request with cache hit: {key=}"
+                            req.set_finish_with_abort(error_msg)
+
+            if add_to_grammar_queue:
+                self.grammar_queue.append(req)
+            else:
+                self._add_request_to_queue(req)
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:

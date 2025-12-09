@@ -286,6 +286,27 @@ class MultimodalDataItem:
         assert self.hash is not None
         self.pad_value = self.hash % (1 << 30)
 
+
+    def hash_feature_async(self):
+        """
+        Set the pad value after first hashing the data
+        """
+        from sglang.srt.managers.mm_utils import hash_feature
+
+        if self.hash is None:
+            if self.feature is not None:
+                hashed_feature = self.feature
+            else:
+                hashed_feature = self.precomputed_embeddings
+            self.hash_gpu = hash_feature(hashed_feature, True)
+
+    def set_pad_value_async(self):
+        from sglang.srt.layers.multimodal import _final_splitmix64
+        assert self.hash_gpu is not None
+        self.hash = _final_splitmix64(int(self.hash_gpu.item()))
+        self.pad_value = self.hash % (1 << 30)
+
+
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
 
@@ -350,16 +371,22 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    async_init: bool = False
+
     @staticmethod
-    def from_dict(obj: dict):
+    def from_dict(obj: dict, async_init=False):
         ret = MultimodalInputs(
             mm_items=obj["mm_items"],
+            async_init=async_init,
         )
-
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
         for item in ret.mm_items:
-            item.set_pad_value()
+            # item.set_pad_value()
+            if async_init:
+                item.hash_feature_async()
+            else:
+                item.set_pad_value()
 
         optional_args = [
             "mrope_positions",
@@ -379,6 +406,12 @@ class MultimodalInputs:
                 setattr(ret, arg, obj[arg])
 
         return ret
+
+    def set_pad_value_async(self):
+        if self.async_init is False:
+            return
+        for item in self.mm_items:
+            item.set_pad_value_async()
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)

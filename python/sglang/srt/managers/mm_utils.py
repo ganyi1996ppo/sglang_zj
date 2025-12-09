@@ -828,7 +828,7 @@ def data_hash(data) -> int:
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
-def tensor_hash(tensor_list) -> int:
+def tensor_hash(tensor_list, async_hash=False) -> int:
     """
     hash a tensor or a tensor list
     """
@@ -840,7 +840,7 @@ def tensor_hash(tensor_list) -> int:
         ]
         tensor = torch.concat(tensor_list)
     if tensor.is_cuda:
-        return gpu_tensor_hash(tensor.cuda())
+        return gpu_tensor_hash(tensor.cuda(), gpu_hash=async_hash)
     tensor = tensor.detach().contiguous()
 
     if tensor.dtype == torch.bfloat16:
@@ -854,15 +854,15 @@ def tensor_hash(tensor_list) -> int:
     return data_hash(mv.tobytes())
 
 
-def hash_feature(f):
+def hash_feature(f, async_hash=False):
     if isinstance(f, list):
         if isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
+            return tensor_hash(f, async_hash)
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
         arr_bytes = arr.tobytes()
         return data_hash(arr_bytes)
     elif isinstance(f, torch.Tensor):
-        return tensor_hash([f])
+        return tensor_hash([f], async_hash)
     return data_hash(f)
